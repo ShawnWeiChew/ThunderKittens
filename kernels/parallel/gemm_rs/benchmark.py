@@ -112,7 +112,7 @@ def run(
 if __name__ == "__main__":
     local_rank, local_world_size = init_distributed_environment()
 
-    for N in [2048, 4096, 8192, 16384, 32768]:
+    for N in [16384, 32768]:
         run(N, N // local_world_size, N, local_rank, local_world_size, num_warmup_iters=1, num_iters=5, check_correctness=False, do_profile=False)
         run(N, N // local_world_size, N, local_rank, local_world_size, num_warmup_iters=10, num_iters=30, check_correctness=False, do_profile=False)
 
