@@ -1,7 +1,7 @@
 # You must set the environment variable ARCH
 # export ARCH=SM90 | SM100
 
-ifeq ($(ARCH),SM100)
+ifeq ($(ARCH),SM103)
 SRC := gemm_rs_b200.cu
 else ifeq ($(ARCH),SM90)
 SRC := gemm_rs_h100.cu

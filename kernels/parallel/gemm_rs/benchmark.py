@@ -2,9 +2,10 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 arch = os.environ.get("ARCH", "")
-assert arch == "SM100" or arch == "SM90", "ARCH must be set to SM100 or SM90"
+assert arch == "SM103" or arch == "SM90", "ARCH must be set to SM103 or SM90"
 
 import torch
+import time
 
 from common import (
     init_distributed_environment,
@@ -51,7 +52,7 @@ def run(
     A = torch.randn(M, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
     if arch == "SM90":
         B = torch.randn(K, N, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
-    elif arch == "SM100":
+    elif arch == "SM103":
         B = torch.randn(N, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
     C_tk = TKParallelTensor(
         (M // local_world_size, N),
@@ -92,7 +93,9 @@ def run(
         profile(combined, num_iters)
 
     tk_avg_ms = benchmark_no_l2_clear(tk_run, num_warmup_iters, num_iters)
+    time.sleep(5)
     nccl_avg_ms = benchmark_no_l2_clear(nccl_run, num_warmup_iters, num_iters)
+    time.sleep(5)
 
     total_flops = 2.0 * M * N * K
     total_tflops = total_flops * 1e-12
@@ -100,7 +103,7 @@ def run(
     tk_tflops = total_tflops / (tk_avg_ms * 1e-3)
     nccl_tflops = total_tflops / (nccl_avg_ms * 1e-3)
 
-    clean_print(f"===============================================================================", print_once=True)
+    clean_print(f"=========================={num_warmup_iters=} | {num_iters=}==========================" , print_once=True)
     clean_print(f"<BF16 TP Matmul | world_size={local_world_size} | {M}x{K}x{N}>", print_once=True)
     clean_print(f"NCCL: {nccl_avg_ms:.3f} ms | {nccl_tflops:.2f} TFLOp/s")
     clean_print(f"TK: {tk_avg_ms:.3f} ms | {tk_tflops:.2f} TFLOp/s")
@@ -110,6 +113,7 @@ if __name__ == "__main__":
     local_rank, local_world_size = init_distributed_environment()
 
     for N in [2048, 4096, 8192, 16384, 32768]:
-        run(N, N // local_world_size, N, local_rank, local_world_size, check_correctness=False, do_profile=False)
+        run(N, N // local_world_size, N, local_rank, local_world_size, num_warmup_iters=1, num_iters=5, check_correctness=False, do_profile=False)
+        run(N, N // local_world_size, N, local_rank, local_world_size, num_warmup_iters=10, num_iters=30, check_correctness=False, do_profile=False)
 
     destroy_distributed_environment()
