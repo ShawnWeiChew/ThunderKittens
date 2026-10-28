@@ -55,7 +55,7 @@ def run(
     elif arch == "SM103":
         B = torch.randn(N, K, dtype=torch.bfloat16, device=f"cuda:{local_rank}") / K ** 0.25
     C_tk = TKParallelTensor(
-        (M // local_world_size, N),
+        (M, N),
         dtype=torch.bfloat16,
         local_rank=local_rank,
         local_world_size=local_world_size,

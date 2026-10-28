@@ -162,12 +162,9 @@ __device__ inline void kernel(const globals &G) {
     else {
         warpgroup::increase_registers<224>();
         d_tt_t d_tt = tm_alloc.allocate<d_tt_t>(warpgroupid*Nb);
-        int fine_Rblocks_per_dev = ((G.A.rows() / CLUSTER_M) * 4) / NUM_DEVICES;
         for(int task_iter = 0; true; task_iter++) {
             int2 rowcol = get_task_idx(G, task_iter, true);
             if(rowcol.x == -1) break;
-            int dst_dev_idx = rowcol.x / fine_Rblocks_per_dev;
-            rowcol.x %= fine_Rblocks_per_dev;
             kittens::wait(outputs_arrived, task_iter%2);
             rt_bf<Mb/4, C_tile::cols> d_reg[4];
             if(warpgroupid == 1) group<8>::sync(15);
@@ -182,14 +179,14 @@ __device__ inline void kernel(const globals &G) {
             if(warpgroupid == 1) group<8>::sync(14);
             warpgroup::store(d_smem, d_reg[0]);
             warpgroup::sync(warpgroupid);
-            warpgroup::tma::store_add_async(G.C[dst_dev_idx], d_smem, {rowcol.x, 4*rowcol.y+0});
+            warpgroup::tma::store_async(G.C[G.dev_idx], d_smem, {rowcol.x, 4*rowcol.y+0});
             #pragma unroll
             for(int i = 1; i < Nb/C_tile::cols; i++) {
                 tma::store_async_read_wait();
                 warpgroup::sync(warpgroupid);
                 warpgroup::store(d_smem, d_reg[i]);
                 warpgroup::sync(warpgroupid);
-                warpgroup::tma::store_add_async(G.C[dst_dev_idx], d_smem, {rowcol.x, 4*rowcol.y+i});
+                warpgroup::tma::store_async(G.C[G.dev_idx], d_smem, {rowcol.x, 4*rowcol.y+i});
             }
             tma::store_async_read_wait();
             if(warpgroupid == 0) group<8>::sync(14);
@@ -241,7 +238,7 @@ void entrypoint(
     };
 
     kittens::py::launch_kernel<matmul_reduce_scatter::config, matmul_reduce_scatter::globals, matmul_reduce_scatter::kernel>(matmul_reduce_scatter_G);
-    kittens::py::launch_kernel<matmul_reduce_scatter_barrier::config, matmul_reduce_scatter_barrier::globals, matmul_reduce_scatter_barrier::kernel>(barrier_G);
+    // kittens::py::launch_kernel<matmul_reduce_scatter_barrier::config, matmul_reduce_scatter_barrier::globals, matmul_reduce_scatter_barrier::kernel>(barrier_G);
 }
 
 #include <torch/csrc/utils/pybind.h>
