@@ -241,9 +241,42 @@ void entrypoint(
     // kittens::py::launch_kernel<matmul_reduce_scatter_barrier::config, matmul_reduce_scatter_barrier::globals, matmul_reduce_scatter_barrier::kernel>(barrier_G);
 }
 
+// Single-process GEMM-only entrypoint: C is a TKParallelTensor with local_world_size == 1.
+// The kernel only stores to G.C[dev_idx], so every PGL slot aliases the local buffer.
+// dev_idx emulates that rank's tile rotation in get_task_idx.
+void gemm_only_entrypoint(
+    const at::Tensor &A,
+    const at::Tensor &B,
+    kittens::py::TKParallelTensor &C,
+    int dev_idx
+) {
+    using C_pgl = matmul_reduce_scatter::globals::C_pgl;
+    kittens::py::tensor_check<C_pgl::GL>(C.data_);
+    TORCH_CHECK(C.local_world_size_ == 1, "gemm_only expects a TKParallelTensor with local_world_size == 1");
+    TORCH_CHECK(!C.multicast_, "gemm_only expects a non-multicast TKParallelTensor");
+    TORCH_CHECK(0 <= dev_idx && dev_idx < C_pgl::num_devices, "dev_idx out of range");
+    TORCH_CHECK(A.size(0) == C.data_.size(0) && B.size(0) == C.data_.size(1) && A.size(1) == B.size(1),
+                "Expected A (M, K), B (N, K), C (M, N)");
+    TORCH_CHECK(A.size(0) % matmul_reduce_scatter::CLUSTER_M == 0, "M must be a multiple of 512");
+    TORCH_CHECK(B.size(0) % matmul_reduce_scatter::CLUSTER_N == 0, "N must be a multiple of 256");
+    TORCH_CHECK(A.size(1) % matmul_reduce_scatter::Kb == 0 && A.size(1) >= 4 * matmul_reduce_scatter::Kb,
+                "K must be a multiple of 64 and at least 256");
+
+    std::vector<uint64_t> ptrs(C_pgl::num_devices, reinterpret_cast<uint64_t>(C.data_.data_ptr()));
+    matmul_reduce_scatter::globals G {
+        .A = kittens::py::tensor_to_gl<typename matmul_reduce_scatter::globals::A_gl>(A),
+        .B = kittens::py::tensor_to_gl<typename matmul_reduce_scatter::globals::B_gl>(B),
+        .C = kittens::make_pgl<C_pgl>(ptrs.data(), 1, 1, C.data_.size(0), C.data_.size(1)),
+        .dev_idx = dev_idx
+    };
+    kittens::py::launch_kernel<matmul_reduce_scatter::config, matmul_reduce_scatter::globals, matmul_reduce_scatter::kernel>(G);
+}
+
 #include <torch/csrc/utils/pybind.h>
 
 PYBIND11_MODULE(_C, m) {
     BIND_TK_PARALLEL_TENSOR(m);
     m.def("matmul_reduce_scatter", &entrypoint);
+    m.def("gemm_only", &gemm_only_entrypoint,
+          pybind11::arg("A"), pybind11::arg("B"), pybind11::arg("C"), pybind11::arg("dev_idx") = 0);
 }

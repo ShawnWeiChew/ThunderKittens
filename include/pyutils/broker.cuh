@@ -15,9 +15,11 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
+#include <string>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -91,7 +93,8 @@ __host__ inline void *create_shm(const char *key, size_t size) {
 
     if (shm_fd < 0) {
         if (errno == EEXIST)
-            throw std::runtime_error("KittensBroker: Named shared memory already exists");
+            throw std::runtime_error(std::string("KittensBroker: Named shared memory already exists; "
+                                                 "remove the stale /dev/shm") + key + " or set KITTENS_BROKER_ID");
         throw std::runtime_error("KittensBroker: Failed to create shared memory");
     }
 
@@ -159,7 +162,7 @@ __host__ inline int create_socket(const char *key, int local_rank) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
 
-    char unique_key[64];
+    char unique_key[sizeof(sockaddr_un::sun_path)];
     int n = snprintf(unique_key, sizeof(unique_key), "%s%d", key, local_rank);
     if (n < 0 || n >= (int)sizeof(unique_key)) {
         close(sock_fd);
@@ -214,7 +217,7 @@ __host__ inline void send_fd(
 
     struct sockaddr_un addr {};
     addr.sun_family = AF_UNIX;
-    char dst_unique_key[64];
+    char dst_unique_key[sizeof(sockaddr_un::sun_path)];
     int n = snprintf(dst_unique_key, sizeof(dst_unique_key), "%s%d", dst_key, dst_local_rank);
     if (n < 0 || n >= (int)sizeof(dst_unique_key)) { 
         free(control_un.control);
@@ -309,11 +312,36 @@ __host__ inline void recv_fd(int sock_fd, int *data_fd, int *src_local_rank) {
 }
 
 __host__ inline void unlink_socket(const char *key, int local_rank) {
-    char unique_key[64];
+    char unique_key[sizeof(sockaddr_un::sun_path)];
     int n = snprintf(unique_key, sizeof(unique_key), "%s%d", key, local_rank);
     if (n < 0 || n >= (int)sizeof(unique_key))
         throw std::runtime_error("KittensBroker: Socket name too long");
     unlink(unique_key);
+}
+
+/**
+ * @brief Suffix shared by every rank of one launch, so concurrent or crashed runs
+ *        never reuse each other's shared memory or sockets. In order of preference:
+ *        KITTENS_BROKER_ID, torchrun's TORCHELASTIC_RUN_ID, MASTER_PORT, and, for a
+ *        single-process group, the PID. Always scoped by UID and world size.
+ */
+__host__ inline std::string run_key_suffix(int local_world_size) {
+    std::string id;
+    const char *run_id = getenv("TORCHELASTIC_RUN_ID");
+    if (const char *broker_id = getenv("KITTENS_BROKER_ID"); broker_id && *broker_id)
+        id = broker_id;
+    else if (run_id && *run_id && strcmp(run_id, "none") != 0)
+        id = run_id;
+    else if (const char *port = getenv("MASTER_PORT"); port && *port)
+        id = std::string("port") + port;
+    else if (local_world_size == 1)
+        id = std::string("pid") + std::to_string(getpid());
+    else
+        id = "default";
+    for (char &c : id)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-'))
+            c = '_';
+    return "_u" + std::to_string(getuid()) + "_w" + std::to_string(local_world_size) + "_" + id;
 }
 
 __host__ inline void close_socket(int sock_fd) {
@@ -338,9 +366,8 @@ __host__ inline void close_socket(int sock_fd) {
         broker.sync(); // wait until all processes reach here
  */
 struct KittensBroker {
-    // TODO: make unique per process group
-    static inline constexpr const char *SHM_KEY_ = "/kittens_broker_shm";
-    static inline constexpr const char *SOCK_KEY_ = "/tmp/kittens_broker.sock";
+    std::string shm_key_;  // e.g. /kittens_broker_shm_u1000_w8_<run id>
+    std::string sock_key_; // e.g. /tmp/kittens_broker_u1000_w8_<run id>.sock<rank>
 
     int local_rank_;
     int local_world_size_;
@@ -350,7 +377,9 @@ struct KittensBroker {
     int sock_;
 
     __host__ inline KittensBroker(int local_rank, int local_world_size)
-        : local_rank_(local_rank), 
+        : shm_key_("/kittens_broker_shm" + detail::broker::run_key_suffix(local_world_size)),
+          sock_key_("/tmp/kittens_broker" + detail::broker::run_key_suffix(local_world_size) + ".sock"),
+          local_rank_(local_rank), 
           local_world_size_(local_world_size),
           shm_raw_(nullptr),
           shm_(nullptr),
@@ -363,21 +392,21 @@ struct KittensBroker {
             throw std::runtime_error("KittensBroker: Local world size is greater than MAX_LOCAL_WORLD_SIZE");
 
         if (local_rank_ == 0) {
-            shm_raw_ = detail::broker::create_shm(SHM_KEY_, sizeof(detail::broker::KittensVault));
+            shm_raw_ = detail::broker::create_shm(shm_key_.c_str(), sizeof(detail::broker::KittensVault));
             shm_ = reinterpret_cast<volatile detail::broker::KittensVault *>(shm_raw_);
             memset(shm_raw_, 0, sizeof(detail::broker::KittensVault));
         } else {
-            shm_raw_ = detail::broker::open_shm(SHM_KEY_, sizeof(detail::broker::KittensVault));
+            shm_raw_ = detail::broker::open_shm(shm_key_.c_str(), sizeof(detail::broker::KittensVault));
             shm_ = reinterpret_cast<volatile detail::broker::KittensVault *>(shm_raw_);
         }
         detail::broker::init_sync(local_rank_, shm_);
         detail::broker::sync(local_world_size_, shm_);
 
         if (local_rank_ ==0)
-            detail::broker::unlink_shm(SHM_KEY_);
+            detail::broker::unlink_shm(shm_key_.c_str());
         detail::broker::sync(local_world_size_, shm_);
 
-        sock_ = detail::broker::create_socket(SOCK_KEY_, local_rank_);
+        sock_ = detail::broker::create_socket(sock_key_.c_str(), local_rank_);
         detail::broker::sync(local_world_size_, shm_);
     }
 
@@ -385,7 +414,9 @@ struct KittensBroker {
     __host__ KittensBroker& operator=(const KittensBroker&) = delete;
 
     __host__ inline KittensBroker(KittensBroker&& other) noexcept
-        : local_rank_(other.local_rank_),
+        : shm_key_(std::move(other.shm_key_)),
+          sock_key_(std::move(other.sock_key_)),
+          local_rank_(other.local_rank_),
           local_world_size_(other.local_world_size_),
           shm_raw_(other.shm_raw_),
           shm_(other.shm_),
@@ -404,7 +435,7 @@ struct KittensBroker {
             shm_ = nullptr;
         }
         if (sock_ >= 0) {
-            detail::broker::unlink_socket(SOCK_KEY_, local_rank_);
+            detail::broker::unlink_socket(sock_key_.c_str(), local_rank_);
             detail::broker::close_socket(sock_);
             sock_ = -1;
         }
@@ -415,6 +446,8 @@ struct KittensBroker {
     __host__ inline KittensBroker& operator=(KittensBroker&& other) noexcept {
         if (this != &other) {
             destroy();
+            shm_key_ = std::move(other.shm_key_);
+            sock_key_ = std::move(other.sock_key_);
             local_rank_ = other.local_rank_;
             local_world_size_ = other.local_world_size_;
             shm_raw_ = other.shm_raw_;
@@ -489,14 +522,14 @@ struct KittensBroker {
                 for (int src_local_rank = 0; src_local_rank < local_world_size_; src_local_rank++) {
                     if (dst_local_rank == src_local_rank)
                         continue;
-                    detail::broker::send_fd(sock_, dst[src_local_rank], SOCK_KEY_, dst_local_rank, src_local_rank);
+                    detail::broker::send_fd(sock_, dst[src_local_rank], sock_key_.c_str(), dst_local_rank, src_local_rank);
                 }
             }
             close(dst[0]); // no longer needed
             dst[0] = -1;
         } else {
             // The rest sends its FD to and receives the other FDs from rank 0
-            detail::broker::send_fd(sock_, data_fd, SOCK_KEY_, 0, local_rank_);
+            detail::broker::send_fd(sock_, data_fd, sock_key_.c_str(), 0, local_rank_);
             close(data_fd); // no longer needed
             for (int i = 0; i < local_world_size_ - 1; i++) {
                 int received_fd;
@@ -527,7 +560,7 @@ struct KittensBroker {
             for (int dst_local_rank = 0; dst_local_rank < local_world_size_; dst_local_rank++) {
                 if (dst_local_rank == src_local_rank)
                     continue;
-                detail::broker::send_fd(sock_, data_fd, SOCK_KEY_, dst_local_rank, src_local_rank);
+                detail::broker::send_fd(sock_, data_fd, sock_key_.c_str(), dst_local_rank, src_local_rank);
             }
             close(data_fd); // no longer needed
         } else {
